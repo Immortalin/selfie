@@ -1021,13 +1021,14 @@ void selfie_disassemble();
 // ------------------------ GLOBAL CONSTANTS -----------------------
 
 int EXCEPTION_NOEXCEPTION        = 0;
-int EXCEPTION_UNKNOWNINSTRUCTION = 1;
-int EXCEPTION_UNKNOWNSYSCALL     = 2;
-int EXCEPTION_ADDRESSERROR       = 3;
-int EXCEPTION_HEAPOVERFLOW       = 4;
-int EXCEPTION_EXIT               = 5;
-int EXCEPTION_TIMER              = 6;
-int EXCEPTION_PAGEFAULT          = 7;
+int EXCEPTION_EXIT               = 1;
+int EXCEPTION_TIMER              = 2;
+int EXCEPTION_PAGEFAULT          = 3;
+int EXCEPTION_SYSCALL            = 4;
+int EXCEPTION_ADDRESSERROR       = 5;
+int EXCEPTION_HEAPOVERFLOW       = 6;
+int EXCEPTION_UNKNOWNINSTRUCTION = 7;
+int EXCEPTION_UNKNOWNSYSCALL     = 8;
 
 int* EXCEPTIONS; // strings representing exceptions
 
@@ -1081,16 +1082,17 @@ int* storesPerAddress = (int*) 0; // number of executed stores per store operati
 // ------------------------- INITIALIZATION ------------------------
 
 void initInterpreter() {
-  EXCEPTIONS = malloc(8 * SIZEOFINTSTAR);
+  EXCEPTIONS = malloc(9 * SIZEOFINTSTAR);
 
   *(EXCEPTIONS + EXCEPTION_NOEXCEPTION)        = (int) "no exception";
-  *(EXCEPTIONS + EXCEPTION_UNKNOWNINSTRUCTION) = (int) "unknown instruction";
-  *(EXCEPTIONS + EXCEPTION_UNKNOWNSYSCALL)     = (int) "unknown syscall";
-  *(EXCEPTIONS + EXCEPTION_ADDRESSERROR)       = (int) "address error";
-  *(EXCEPTIONS + EXCEPTION_HEAPOVERFLOW)       = (int) "heap overflow";
   *(EXCEPTIONS + EXCEPTION_EXIT)               = (int) "exit";
   *(EXCEPTIONS + EXCEPTION_TIMER)              = (int) "timer interrupt";
   *(EXCEPTIONS + EXCEPTION_PAGEFAULT)          = (int) "page fault";
+  *(EXCEPTIONS + EXCEPTION_SYSCALL)            = (int) "syscall";
+  *(EXCEPTIONS + EXCEPTION_ADDRESSERROR)       = (int) "address error";
+  *(EXCEPTIONS + EXCEPTION_HEAPOVERFLOW)       = (int) "heap overflow";
+  *(EXCEPTIONS + EXCEPTION_UNKNOWNINSTRUCTION) = (int) "unknown instruction";
+  *(EXCEPTIONS + EXCEPTION_UNKNOWNSYSCALL)     = (int) "unknown syscall";
 }
 
 void resetInterpreter() {
@@ -1108,7 +1110,7 @@ void resetInterpreter() {
 
   trap = 0;
 
-  status = 0;
+  status = EXCEPTION_NOEXCEPTION;
 
   cycles = 0;
 
@@ -4663,25 +4665,8 @@ void emitExit() {
 }
 
 void implementExit() {
-  int exitCode;
-
-  exitCode = *(getFrameForContextData(registers, REG_A0));
-
-  // exit code must be signed 16-bit integer
-  if (exitCode > INT16_MAX)
-    exitCode = INT16_MAX;
-  else if (exitCode < INT16_MIN)
-    exitCode = INT16_MIN;
-
-  throwException(EXCEPTION_EXIT, exitCode);
-
-  print(binaryName);
-  print((int*) ": exiting with exit code ");
-  printInteger(*(getFrameForContextData(registers, REG_A0)));
-  print((int*) " and ");
-  printFixedPointRatio(brk - maxBinaryLength, MEGABYTE);
-  print((int*) "MB of mallocated memory");
-  println();
+  // trap; syscall should be handled by parent
+  throwException(EXCEPTION_SYSCALL, SYSCALL_EXIT);
 }
 
 void emitRead() {
@@ -5040,37 +5025,8 @@ void emitMalloc() {
 }
 
 void implementMalloc() {
-  int size;
-  int bump;
-
-  if (debug_malloc) {
-    print(binaryName);
-    print((int*) ": trying to malloc ");
-    printInteger(*(getFrameForContextData(registers, REG_A0)));
-    print((int*) " bytes");
-    println();
-  }
-
-  size = roundUp(*(getFrameForContextData(registers, REG_A0)), WORDSIZE);
-
-  bump = brk;
-
-  if (bump + size >= *(getFrameForContextData(registers, REG_SP)))
-    throwException(EXCEPTION_HEAPOVERFLOW, 0);
-  else {
-    *(getFrameForContextData(registers, REG_V0)) = bump;
-
-    brk = bump + size;
-
-    if (debug_malloc) {
-      print(binaryName);
-      print((int*) ": actually mallocating ");
-      printInteger(size);
-      print((int*) " bytes at virtual address ");
-      printHexadecimal(bump, 8);
-      println();
-    }
-  }
+  // trap; syscall should be handled by parent
+  throwException(EXCEPTION_SYSCALL, SYSCALL_MALLOC);
 }
 
 // -----------------------------------------------------------------
@@ -5255,7 +5211,7 @@ int doStatus() {
 
   savedStatus = status;
 
-  status = 0;
+  status = EXCEPTION_NOEXCEPTION;
 
   if (debug_status) {
     print(binaryName);
@@ -7035,6 +6991,9 @@ int runOrHostUntilExitWithPageFaultHandling(int toID) {
   int exceptionNumber;
   int exceptionParameter;
   int frame;
+  int size;
+  int bump;
+  int exitCode;
 
   while (1) {
     fromID = selfie_switch(toID);
@@ -7048,7 +7007,7 @@ int runOrHostUntilExitWithPageFaultHandling(int toID) {
 
     // assert: fromContext must be in usedContexts (created here)
     //         or in case of mipster in 
-
+      
     if (getParent(fromContext) != selfie_ID())
       // switch to parent which is in charge of handling exceptions
       toID = getParent(fromContext);
@@ -7064,13 +7023,63 @@ int runOrHostUntilExitWithPageFaultHandling(int toID) {
 
         // TODO: use this table to unmap and reuse frames
         mapPage(getPT(fromContext), exceptionParameter, frame);
-        // mapPage(getPhysAddr(getID(fromContext), (int) getPT(fromContext)), exceptionParameter, frame);
+        
         // page table on microkernel boot level
         selfie_map(fromID, exceptionParameter, frame);
       } else if (exceptionNumber == EXCEPTION_EXIT)
         // TODO: only return if all contexts have exited
         return exceptionParameter;
-      else if (exceptionNumber != EXCEPTION_TIMER) {
+      else if (exceptionNumber == EXCEPTION_SYSCALL) {
+        if(exceptionParameter == SYSCALL_EXIT) { // exit call
+          exitCode = *(getFrameForContextData(getRegs(fromContext), REG_A0));
+
+          // exit code must be signed 16-bit integer
+          if (exitCode > INT16_MAX)
+            exitCode = INT16_MAX;
+          else if (exitCode < INT16_MIN)
+            exitCode = INT16_MIN;          
+
+          print(binaryName);
+          print((int*) ": exiting with exit code ");
+          printInteger(*(getFrameForContextData(registers, REG_A0)));
+          print((int*) " and ");
+          printFixedPointRatio(brk - maxBinaryLength, MEGABYTE);
+          print((int*) "MB of mallocated memory");
+          println();
+
+          return exitCode;
+        }
+        else if(exceptionParameter == SYSCALL_MALLOC) { // malloc call
+          if (debug_malloc) {
+            print(binaryName);
+            print((int*) ": trying to malloc ");
+            printInteger(*(getFrameForContextData(getRegs(fromContext), REG_A0)));
+            print((int*) " bytes");
+            println();
+          }
+
+          size = roundUp(*(getFrameForContextData(getRegs(fromContext), REG_A0)), WORDSIZE);
+
+          bump = brk;
+
+          if (bump + size >= *(getFrameForContextData(getRegs(fromContext), REG_SP)))
+            throwException(EXCEPTION_HEAPOVERFLOW, 0);
+          else {
+            *(getFrameForContextData(getRegs(fromContext), REG_V0)) = bump;
+
+            brk = bump + size;
+
+            if (debug_malloc) {
+              print(binaryName);
+              print((int*) ": actually mallocating ");
+              printInteger(size);
+              print((int*) " bytes at virtual address ");
+              printHexadecimal(bump, 8);
+              println();
+            }
+          }
+        }
+      } else if (exceptionNumber != EXCEPTION_TIMER) {
         print(binaryName);
         print((int*) ": context ");
         printInteger(getID(fromContext));
